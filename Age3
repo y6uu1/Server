@@ -1,0 +1,81 @@
+local Players = game:GetService("Players")
+local Stats = game:GetService("Stats")
+
+local CONFIG = {
+    HEARTBEAT_INTERVAL = 60,
+    GC_INTERVAL = 300,
+    LOG_STATS = true,
+    MEMORY_WARNING_MB = 3000,
+}
+
+local function getMemoryUsageMB()
+    local ok, result = pcall(function()
+        return Stats:GetTotalMemoryUsageMb()
+    end)
+    return ok and result or -1
+end
+
+local function logStats(prefix)
+    if not CONFIG.LOG_STATS then return end
+
+    local memMB = getMemoryUsageMB()
+    local playerCount = #Players:GetPlayers()
+
+    print(("[%s] اللاعبون: %d | الذاكرة: %.2f MB | وقت التشغيل: %.0f ثانية")
+        :format(prefix, playerCount, memMB, workspace.DistributedGameTime))
+
+    if memMB > 0 and memMB >= CONFIG.MEMORY_WARNING_MB then
+        warn(("⚠️ استهلاك الذاكرة مرتفع: %.2f MB (الحد المحدد: %d MB)")
+            :format(memMB, CONFIG.MEMORY_WARNING_MB))
+    end
+end
+
+local function startHeartbeatLoop()
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.HEARTBEAT_INTERVAL)
+
+            if #Players:GetPlayers() == 0 then
+                continue
+            end
+
+            logStats("Heartbeat")
+        end
+    end)
+end
+
+local function startGarbageCollectionLoop()
+    task.spawn(function()
+        while true do
+            task.wait(CONFIG.GC_INTERVAL)
+
+            local before = getMemoryUsageMB()
+            collectgarbage("collect")
+            local after = getMemoryUsageMB()
+
+            if CONFIG.LOG_STATS then
+                print(("[GC] تم تنظيف الذاكرة: %.2f MB → %.2f MB (تحرير %.2f MB)")
+                    :format(before, after, math.max(before - after, 0)))
+            end
+        end
+    end)
+end
+
+local function connectPlayerEvents()
+    Players.PlayerAdded:Connect(function(player)
+        logStats("PlayerAdded: " .. player.Name)
+    end)
+
+    Players.PlayerRemoving:Connect(function(player)
+        logStats("PlayerRemoving: " .. player.Name)
+    end)
+end
+
+local function init()
+    connectPlayerEvents()
+    startHeartbeatLoop()
+    startGarbageCollectionLoop()
+    print("✅ ServerStabilityManager: تم التفعيل بنجاح.")
+end
+
+init()
