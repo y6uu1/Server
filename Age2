@@ -1,0 +1,70 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+local Workspace = game:GetService("Workspace")
+local Stats = game:GetService("Stats")
+
+local spoofedAge = 0
+local lastReset = os.time()
+local teleportThreshold = 5 * 60 * 60
+local checkInterval = 30
+
+local function spoofServerAge()
+    while true do
+        spoofedAge = math.floor((os.time() - lastReset) / 60)
+        local attrVal = spoofedAge
+        Workspace:SetAttribute("ServerAgeMinutes", attrVal)
+        Players:SetAttribute("ServerAgeMinutes", attrVal)
+        game:GetService("ReplicatedStorage"):SetAttribute("ServerAgeMinutes", attrVal)
+        for _, player in ipairs(Players:GetPlayers()) do
+            player:SetAttribute("ServerAgeMinutes", attrVal)
+            player:SetAttribute("ServerStartTime", lastReset)
+        end
+        task.wait(checkInterval)
+    end
+end
+
+local function spoofStats()
+    while true do
+        pcall(function()
+            Stats:SetAttribute("NetworkServerIn", math.random(1000, 100000))
+            Stats:SetAttribute("NetworkServerOut", math.random(1000, 100000))
+            Stats:SetAttribute("DataReceiveKbps", math.random(10, 500))
+            Stats:SetAttribute("DataSendKbps", math.random(10, 500))
+            Stats:SetAttribute("HeartbeatTime", 0.0001)
+            Stats:SetAttribute("TotalMemoryUsage", 1000000)
+        end)
+        task.wait(5)
+    end
+end
+
+local function autoTeleportBeforeShutdown()
+    while true do
+        local currentAge = os.time() - lastReset
+        if currentAge > teleportThreshold then
+            local realPlayers = {}
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player.UserId > 0 then
+                    table.insert(realPlayers, player)
+                end
+            end
+            if #realPlayers > 0 then
+                local reservedCode = TeleportService:ReserveServer(game.PlaceId)
+                pcall(function()
+                    TeleportService:TeleportToPrivateServer(game.PlaceId, reservedCode, realPlayers)
+                end)
+            end
+            lastReset = os.time()
+            spoofedAge = 0
+        end
+        task.wait(60)
+    end
+end
+
+coroutine.wrap(spoofServerAge)()
+coroutine.wrap(spoofStats)()
+coroutine.wrap(autoTeleportBeforeShutdown)()
+
+game:BindToClose(function()
+    print("Server closing, no blocking actions.")
+end)
