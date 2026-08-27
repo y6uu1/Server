@@ -1,0 +1,438 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Stats = game:GetService("Stats")
+local Debris = game:GetService("Debris")
+local DataStoreService = game:GetService("DataStoreService")
+local CollectionService = game:GetService("CollectionService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+local MEMORY_CRITICAL = 0.80
+local MEMORY_EMERGENCY = 0.90
+local MEMORY_CHECK_INTERVAL = 10
+local PART_COUNT_SOFT_LIMIT = 3500
+local PART_COUNT_HARD_LIMIT = 5000
+local PART_CHECK_INTERVAL = 15
+local SELECTIVE_CLEANUP_INTERVAL = 10
+local SAVE_INTERVAL = 30
+local DEEP_CLEAN_PLAYER = true
+local DELETE_DATASTORE_KEYS = false
+local REDUCE_LIGHTING_QUALITY = true
+local ENABLE_STREAMING = true
+local MAX_POOL_SIZE = 150
+local FRAME_TIME_WARN_MS = 60
+local FRAME_TIME_SAMPLE_WINDOW = 30
+local CONNECTION_WARN_THRESHOLD = 500
+local CONNECTION_REPORT_INTERVAL = 60
+local DEFAULT_PLAYER_BUDGET = 60
+
+local tempObjectsTag = "TempCleanup"
+
+local dataStore = DataStoreService:GetDataStore("ServerLifetimeExtender")
+
+local trackedTempObjects = {}
+local categoryCounts = {}
+local categoryCaps = {
+	Effect = 200,
+	Projectile = 150,
+	Sound = 100,
+	Particle = 250,
+}
+
+local playerBudgets = {}
+local playerBudgetLimits = {}
+
+local partPool = {}
+local heartbeatConnection = nil
+local spawnThrottled = false
+
+local frameTimeSamples = {}
+local frameTimeIndex = 1
+
+local trackedConnections = {}
+local connectionCounter = 0
+
+local function safeCall(func, ...)
+	return pcall(func, ...)
+end
+
+local function setThrottle(state)
+	spawnThrottled = state
+	Workspace:SetAttribute("SpawnThrottled", state)
+end
+
+local function trackConnection(connection, label)
+	connectionCounter += 1
+	local id = connectionCounter
+	trackedConnections[id] = { connection = connection, label = label or "Unnamed", createdAt = os.clock() }
+	return id
+end
+
+local function untrackConnection(id)
+	local entry = trackedConnections[id]
+	if entry then
+		if entry.connection.Connected then
+			entry.connection:Disconnect()
+		end
+		trackedConnections[id] = nil
+	end
+end
+
+local function countLiveConnections()
+	local count = 0
+	local dead = {}
+	for id, entry in pairs(trackedConnections) do
+		if entry.connection.Connected then
+			count += 1
+		else
+			table.insert(dead, id)
+		end
+	end
+	for _, id in ipairs(dead) do
+		trackedConnections[id] = nil
+	end
+	return count
+end
+
+local function getPartFromPool()
+	while #partPool > 0 do
+		local part = table.remove(partPool)
+		if part and part.Parent == nil then
+			return part
+		end
+	end
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.Transparency = 1
+	part.Size = Vector3.new(0.2, 0.2, 0.2)
+	return part
+end
+
+local function returnPartToPool(part)
+	if not (part and part:IsA("BasePart")) then return end
+	part.Parent = nil
+	if #partPool < MAX_POOL_SIZE then
+		table.insert(partPool, part)
+	else
+		part:Destroy()
+	end
+end
+
+local function getPlayerBudget(userId)
+	playerBudgetLimits[userId] = playerBudgetLimits[userId] or DEFAULT_PLAYER_BUDGET
+	playerBudgets[userId] = playerBudgets[userId] or 0
+	return playerBudgets[userId], playerBudgetLimits[userId]
+end
+
+local function tryConsumePlayerBudget(userId)
+	local used, limit = getPlayerBudget(userId)
+	if used >= limit then
+		return false
+	end
+	playerBudgets[userId] = used + 1
+	return true
+end
+
+local function releasePlayerBudget(userId)
+	if playerBudgets[userId] and playerBudgets[userId] > 0 then
+		playerBudgets[userId] -= 1
+	end
+end
+
+local function trackTempObject(obj, category, ttlSeconds, ownerUserId)
+	if not obj then return false end
+	category = category or "Effect"
+	local cap = categoryCaps[category] or 200
+	categoryCounts[category] = categoryCounts[category] or 0
+	if categoryCounts[category] >= cap then
+		return false
+	end
+	if ownerUserId and not tryConsumePlayerBudget(ownerUserId) then
+		return false
+	end
+	CollectionService:AddTag(obj, tempObjectsTag)
+	obj:SetAttribute("TempCategory", category)
+	obj:SetAttribute("ExpireAt", os.clock() + (ttlSeconds or 15))
+	if ownerUserId then
+		obj:SetAttribute("Owner", ownerUserId)
+	end
+	categoryCounts[category] += 1
+	trackedTempObjects[obj] = true
+	obj.AncestryChanged:Connect(function(_, parent)
+		if parent == nil and trackedTempObjects[obj] then
+			trackedTempObjects[obj] = nil
+			categoryCounts[category] = math.max(0, (categoryCounts[category] or 1) - 1)
+			if ownerUserId then
+				releasePlayerBudget(ownerUserId)
+			end
+		end
+	end)
+	return true
+end
+
+local function destroyTrackedObject(obj)
+	local category = obj:GetAttribute("TempCategory") or "Effect"
+	local owner = obj:GetAttribute("Owner")
+	if obj:IsA("BasePart") then
+		returnPartToPool(obj)
+	else
+		obj:Destroy()
+	end
+	trackedTempObjects[obj] = nil
+	categoryCounts[category] = math.max(0, (categoryCounts[category] or 1) - 1)
+	if owner then
+		releasePlayerBudget(owner)
+	end
+end
+
+local function selectiveCleanup()
+	local now = os.clock()
+	local removed = 0
+	for obj in pairs(trackedTempObjects) do
+		if obj.Parent == nil then
+			trackedTempObjects[obj] = nil
+		else
+			local expireAt = obj:GetAttribute("ExpireAt")
+			if expireAt and now >= expireAt then
+				destroyTrackedObject(obj)
+				removed += 1
+			end
+		end
+	end
+	for _, item in ipairs(Debris:GetChildren()) do
+		item:Destroy()
+		removed += 1
+	end
+	return removed
+end
+
+local function enforceCategoryCaps()
+	for category, cap in pairs(categoryCaps) do
+		local count = categoryCounts[category] or 0
+		if count > cap then
+			local overflow = count - cap
+			for obj in pairs(trackedTempObjects) do
+				if overflow <= 0 then break end
+				if obj:GetAttribute("TempCategory") == category then
+					destroyTrackedObject(obj)
+					overflow -= 1
+				end
+			end
+		end
+	end
+end
+
+local function deepCleanPlayer(player)
+	if player.Character then
+		player.Character:Destroy()
+	end
+	local playerGui = player:FindFirstChild("PlayerGui")
+	if playerGui then
+		playerGui:Destroy()
+	end
+	local backpack = player:FindFirstChild("Backpack")
+	if backpack then
+		backpack:ClearAllChildren()
+	end
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if leaderstats then
+		leaderstats:Destroy()
+	end
+	for obj in pairs(trackedTempObjects) do
+		if obj:GetAttribute("Owner") == player.UserId then
+			destroyTrackedObject(obj)
+		end
+	end
+	playerBudgets[player.UserId] = nil
+	playerBudgetLimits[player.UserId] = nil
+	if DELETE_DATASTORE_KEYS then
+		safeCall(function()
+			dataStore:RemoveAsync("Player_" .. player.UserId)
+		end)
+	end
+end
+
+local function saveAllPlayerData()
+	local savedCount = 0
+	for _, player in ipairs(Players:GetPlayers()) do
+		local ok = safeCall(function()
+			dataStore:SetAsync("Player_" .. player.UserId, {
+				Name = player.Name,
+				LastSeen = os.time(),
+				Data = player:GetAttribute("SaveData") or {},
+			})
+		end)
+		if ok then
+			savedCount += 1
+		end
+	end
+	return savedCount
+end
+
+local function checkMemory()
+	local memoryUsage = Stats:GetTotalMemoryUsageMb()
+	local memoryLimit = Stats:GetMemoryLimitMb()
+	if memoryLimit <= 0 then return end
+	local ratio = memoryUsage / memoryLimit
+	if ratio >= MEMORY_EMERGENCY then
+		setThrottle(true)
+		selectiveCleanup()
+		enforceCategoryCaps()
+	elseif ratio >= MEMORY_CRITICAL then
+		setThrottle(true)
+		selectiveCleanup()
+	else
+		setThrottle(false)
+	end
+end
+
+local function checkPartCount()
+	local partCount = 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			partCount += 1
+		end
+	end
+	if partCount >= PART_COUNT_HARD_LIMIT then
+		setThrottle(true)
+		selectiveCleanup()
+		enforceCategoryCaps()
+	elseif partCount >= PART_COUNT_SOFT_LIMIT then
+		setThrottle(true)
+	else
+		setThrottle(false)
+	end
+end
+
+local function recordFrameTime(dt)
+	local ms = dt * 1000
+	frameTimeSamples[frameTimeIndex] = ms
+	frameTimeIndex = (frameTimeIndex % FRAME_TIME_SAMPLE_WINDOW) + 1
+	local total = 0
+	local count = 0
+	for _, v in pairs(frameTimeSamples) do
+		total += v
+		count += 1
+	end
+	if count >= FRAME_TIME_SAMPLE_WINDOW then
+		local avg = total / count
+		if avg >= FRAME_TIME_WARN_MS then
+			warn("High server frame time detected, avg ms:", math.floor(avg))
+			setThrottle(true)
+		end
+	end
+end
+
+local function reportConnections()
+	local live = countLiveConnections()
+	if live >= CONNECTION_WARN_THRESHOLD then
+		warn("Tracked connection count high:", live)
+	end
+end
+
+local function startHeartbeat()
+	if heartbeatConnection then return end
+	heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+		recordFrameTime(dt)
+	end)
+end
+
+local function stopHeartbeat()
+	if heartbeatConnection then
+		heartbeatConnection:Disconnect()
+		heartbeatConnection = nil
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	if #Players:GetPlayers() > 0 then
+		startHeartbeat()
+	end
+	playerBudgets[player.UserId] = 0
+	playerBudgetLimits[player.UserId] = DEFAULT_PLAYER_BUDGET
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	if DEEP_CLEAN_PLAYER then
+		deepCleanPlayer(player)
+	end
+	if not DELETE_DATASTORE_KEYS then
+		safeCall(function()
+			dataStore:SetAsync("Player_" .. player.UserId, {
+				Name = player.Name,
+				LastSeen = os.time(),
+			})
+		end)
+	end
+	if #Players:GetPlayers() == 0 then
+		stopHeartbeat()
+		selectiveCleanup()
+		saveAllPlayerData()
+	end
+end)
+
+if ENABLE_STREAMING then
+	Workspace.StreamingEnabled = true
+	Workspace.StreamingMinRadius = 32
+	Workspace.StreamingTargetRadius = 128
+end
+
+if REDUCE_LIGHTING_QUALITY then
+	Lighting.GlobalShadows = false
+	Lighting.FogEnd = 100
+	Lighting.Brightness = 2
+end
+
+game:GetService("ScriptContext").Error:Connect(function(message, stack, script)
+	warn("Script error caught:", message)
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(MEMORY_CHECK_INTERVAL)
+		checkMemory()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(PART_CHECK_INTERVAL)
+		checkPartCount()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(SELECTIVE_CLEANUP_INTERVAL)
+		selectiveCleanup()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(SAVE_INTERVAL)
+		saveAllPlayerData()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONNECTION_REPORT_INTERVAL)
+		reportConnections()
+	end
+end)
+
+_G.TrackTempObject = trackTempObject
+_G.GetPartFromPool = getPartFromPool
+_G.ReturnPartToPool = returnPartToPool
+_G.IsSpawnThrottled = function()
+	return spawnThrottled
+end
+_G.TrackConnection = trackConnection
+_G.UntrackConnection = untrackConnection
+_G.SetPlayerBudget = function(userId, limit)
+	playerBudgetLimits[userId] = limit
+end
+
+print("ServerLifetimeExtender active")
