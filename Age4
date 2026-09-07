@@ -1,0 +1,1098 @@
+--!strict
+
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local HttpService = game:GetService("HttpService")
+
+local CONFIG = {
+	DataStoreName = "LongRuntime_PlayerData_V4",
+	SessionMapName = "LongRuntime_Sessions_V4",
+
+	AutoSaveInterval = 60,
+	SessionRefreshInterval = 20,
+	SessionExpiration = 90,
+
+	HealthInterval = 10,
+	CleanupInterval = 60,
+	StatusInterval = 300,
+
+	LoadRetries = 6,
+	SaveRetries = 6,
+
+	RetryBase = 2,
+	RetryMax = 15,
+
+	DataStoreBudgetTimeout = 15,
+	ShutdownBudget = 25,
+
+	MinimumReadBudget = 1,
+	MinimumWriteBudget = 1,
+
+	MaxTrackedTasks = 1000,
+	MaxTrackedConnections = 5000,
+
+	EnableDebug = true,
+	EnableStatus = true,
+}
+
+local DEFAULT_DATA = {
+	Version = 1,
+	Coins = 0,
+	Level = 1,
+	XP = 0,
+}
+
+local Store = DataStoreService:GetDataStore(CONFIG.DataStoreName)
+local SessionMap = MemoryStoreService:GetHashMap(CONFIG.SessionMapName)
+
+local ServerId = game.JobId
+
+if ServerId == "" then
+	ServerId = HttpService:GenerateGUID(false)
+end
+
+local StartedAt = os.clock()
+local ShutdownStarted = false
+
+local Manager = {}
+
+Manager.ServerId = ServerId
+Manager.StartedAt = StartedAt
+
+Manager.PlayerData = {}
+Manager.PlayerLoaded = {}
+Manager.PlayerLoading = {}
+Manager.PlayerSaving = {}
+Manager.PlayerSessions = {}
+
+Manager.Services = {}
+Manager.Connections = {}
+Manager.Tasks = {}
+Manager.CleanupObjects = {}
+
+Manager.Stats = {
+	Heartbeats = 0,
+	HealthChecks = 0,
+	CleanupRuns = 0,
+	PlayersJoined = 0,
+	PlayersLeft = 0,
+	Loads = 0,
+	LoadFailures = 0,
+	Saves = 0,
+	SaveFailures = 0,
+	SessionClaims = 0,
+	SessionRefreshes = 0,
+	SessionConflicts = 0,
+	SessionFailures = 0,
+	Errors = 0,
+}
+
+local function log(...)
+	if CONFIG.EnableDebug then
+		print("[ServerManagerV4]", ...)
+	end
+end
+
+local function warnLog(...)
+	warn("[ServerManagerV4]", ...)
+end
+
+local function safeCall(name, callback)
+	local success, result = pcall(callback)
+
+	if not success then
+		Manager.Stats.Errors += 1
+		warnLog(name, result)
+	end
+
+	return success, result
+end
+
+local function deepCopy(value)
+	if type(value) ~= "table" then
+		return value
+	end
+
+	local result = {}
+
+	for key, child in pairs(value) do
+		result[key] = deepCopy(child)
+	end
+
+	return result
+end
+
+local function mergeDefaults(data)
+	local result = deepCopy(DEFAULT_DATA)
+
+	if type(data) == "table" then
+		for key, value in pairs(data) do
+			result[key] = deepCopy(value)
+		end
+	end
+
+	return result
+end
+
+local function getBudget(requestType)
+	local success, budget = pcall(function()
+		return DataStoreService:GetRequestBudgetForRequestType(requestType)
+	end)
+
+	if success and type(budget) == "number" then
+		return budget
+	end
+
+	return 0
+end
+
+local function waitForBudget(requestType, minimum, timeout)
+	local started = os.clock()
+
+	while os.clock() - started < timeout do
+		if getBudget(requestType) >= minimum then
+			return true
+		end
+
+		task.wait(1)
+	end
+
+	return false
+end
+
+local function retryDelay(attempt)
+	return math.min(CONFIG.RetryBase ^ attempt, CONFIG.RetryMax)
+end
+
+local function playerKey(userId)
+	return "Player_" .. tostring(userId)
+end
+
+local function sessionKey(userId)
+	return "Session_" .. tostring(userId)
+end
+
+local function newSession(userId)
+	local now = os.time()
+
+	return {
+		ServerId = ServerId,
+		UserId = userId,
+		Created = now,
+		Updated = now,
+		Expires = now + CONFIG.SessionExpiration,
+	}
+end
+
+function Manager:Connect(signal, callback)
+	if #self.Connections >= CONFIG.MaxTrackedConnections then
+		warnLog("Connection registry limit reached")
+		return nil
+	end
+
+	local connection = signal:Connect(function(...)
+		local success, err = pcall(callback, ...)
+
+		if not success then
+			self.Stats.Errors += 1
+			warnLog("Connection callback failed:", err)
+		end
+	end)
+
+	table.insert(self.Connections, connection)
+
+	return connection
+end
+
+function Manager:TrackTask(name, callback)
+	if #self.Tasks >= CONFIG.MaxTrackedTasks then
+		warnLog("Task registry limit reached:", name)
+		return nil
+	end
+
+	local info = {
+		Name = name,
+		Running = true,
+		Started = os.clock(),
+	}
+
+	table.insert(self.Tasks, info)
+
+	task.spawn(function()
+		local success, err = pcall(callback)
+
+		info.Running = false
+		info.Finished = os.clock()
+
+		if not success then
+			self.Stats.Errors += 1
+			warnLog("Task failed:", name, err)
+		end
+	end)
+
+	return info
+end
+
+function Manager:RegisterCleanup(instance)
+	if instance and instance:IsA("Instance") then
+		self.CleanupObjects[instance] = true
+	end
+end
+
+function Manager:UnregisterCleanup(instance)
+	self.CleanupObjects[instance] = nil
+end
+
+function Manager:RegisterService(name)
+	if self.Services[name] then
+		return self.Services[name]
+	end
+
+	local service = {
+		Name = name,
+		Healthy = true,
+		LastHeartbeat = os.clock(),
+		Errors = 0,
+	}
+
+	self.Services[name] = service
+
+	return service
+end
+
+function Manager:HeartbeatService(name)
+	local service = self.Services[name] or self:RegisterService(name)
+
+	service.LastHeartbeat = os.clock()
+	service.Healthy = true
+
+	return true
+end
+
+function Manager:ServiceError(name)
+	local service = self.Services[name] or self:RegisterService(name)
+
+	service.Errors += 1
+
+	return true
+end
+
+function Manager:CheckServices()
+	local now = os.clock()
+
+	for _, service in pairs(self.Services) do
+		local elapsed = now - service.LastHeartbeat
+
+		if elapsed > 60 then
+			service.Healthy = false
+
+			if CONFIG.EnableDebug then
+				warnLog(
+					"Service unhealthy:",
+					service.Name,
+					math.floor(elapsed),
+					"seconds"
+				)
+			end
+		else
+			service.Healthy = true
+		end
+	end
+end
+
+function Manager:GetAgeSeconds()
+	return os.clock() - StartedAt
+end
+
+function Manager:GetAgeMinutes()
+	return self:GetAgeSeconds() / 60
+end
+
+function Manager:GetAgeHours()
+	return self:GetAgeSeconds() / 3600
+end
+
+function Manager:GetAgeDays()
+	return self:GetAgeSeconds() / 86400
+end
+
+function Manager:GetInfo()
+	local healthy = 0
+	local total = 0
+
+	for _, service in pairs(self.Services) do
+		total += 1
+
+		if service.Healthy then
+			healthy += 1
+		end
+	end
+
+	return {
+		JobId = ServerId,
+		AgeSeconds = self:GetAgeSeconds(),
+		AgeMinutes = self:GetAgeMinutes(),
+		AgeHours = self:GetAgeHours(),
+		AgeDays = self:GetAgeDays(),
+		Players = #Players:GetPlayers(),
+		ServicesHealthy = healthy,
+		ServicesTotal = total,
+		Loads = self.Stats.Loads,
+		LoadFailures = self.Stats.LoadFailures,
+		Saves = self.Stats.Saves,
+		SaveFailures = self.Stats.SaveFailures,
+		SessionClaims = self.Stats.SessionClaims,
+		SessionRefreshes = self.Stats.SessionRefreshes,
+		SessionConflicts = self.Stats.SessionConflicts,
+		Errors = self.Stats.Errors,
+		Tasks = #self.Tasks,
+		Connections = #self.Connections,
+	}
+end
+
+function Manager:ClaimSession(player)
+	local userId = player.UserId
+	local key = sessionKey(userId)
+	local claimed = false
+
+	for attempt = 1, CONFIG.LoadRetries do
+		local success, result = safeCall("SessionClaim", function()
+			return SessionMap:UpdateAsync(
+				key,
+				function(oldValue)
+					local now = os.time()
+
+					if type(oldValue) == "table" then
+						if oldValue.ServerId ~= ServerId then
+							if type(oldValue.Expires) == "number" and oldValue.Expires > now then
+								return oldValue
+							end
+						end
+					end
+
+					claimed = true
+
+					return newSession(userId)
+				end,
+				CONFIG.SessionExpiration
+			)
+		end)
+
+		if success then
+			if type(result) == "table" and result.ServerId == ServerId then
+				claimed = true
+			end
+
+			if claimed then
+				self.PlayerSessions[userId] = true
+				self.Stats.SessionClaims += 1
+
+				return true
+			end
+
+			self.Stats.SessionConflicts += 1
+			return false
+		end
+
+		self.Stats.SessionFailures += 1
+
+		task.wait(retryDelay(attempt))
+	end
+
+	return false
+end
+
+function Manager:RefreshSession(player)
+	local userId = player.UserId
+
+	if not self.PlayerSessions[userId] then
+		return false
+	end
+
+	local key = sessionKey(userId)
+
+	for attempt = 1, 3 do
+		local success, result = safeCall("SessionRefresh", function()
+			return SessionMap:UpdateAsync(
+				key,
+				function(oldValue)
+					local now = os.time()
+
+					if type(oldValue) ~= "table" then
+						return newSession(userId)
+					end
+
+					if oldValue.ServerId ~= ServerId then
+						return oldValue
+					end
+
+					oldValue.Updated = now
+					oldValue.Expires = now + CONFIG.SessionExpiration
+
+					return oldValue
+				end,
+				CONFIG.SessionExpiration
+			)
+		end)
+
+		if success then
+			if type(result) == "table" and result.ServerId == ServerId then
+				self.Stats.SessionRefreshes += 1
+				return true
+			end
+
+			self.PlayerSessions[userId] = nil
+			return false
+		end
+
+		task.wait(math.min(attempt * 2, 5))
+	end
+
+	return false
+end
+
+function Manager:ReleaseSession(player)
+	local userId = player.UserId
+
+	if not self.PlayerSessions[userId] then
+		return true
+	end
+
+	local key = sessionKey(userId)
+
+	for attempt = 1, 3 do
+		local success = safeCall("SessionRelease", function()
+			SessionMap:UpdateAsync(
+				key,
+				function(oldValue)
+					if type(oldValue) == "table" and oldValue.ServerId == ServerId then
+						return nil
+					end
+
+					return oldValue
+				end,
+				CONFIG.SessionExpiration
+			)
+		end)
+
+		if success then
+			self.PlayerSessions[userId] = nil
+			return true
+		end
+
+		task.wait(math.min(attempt * 2, 5))
+	end
+
+	return false
+end
+
+function Manager:LoadPlayer(player)
+	local userId = player.UserId
+
+	if self.PlayerLoaded[userId] then
+		return true
+	end
+
+	if self.PlayerLoading[userId] then
+		return false
+	end
+
+	self.PlayerLoading[userId] = true
+
+	local claimed = self:ClaimSession(player)
+
+	if not claimed then
+		self.PlayerLoading[userId] = nil
+
+		if player.Parent then
+			player:Kick("بيانات حسابك مستخدمة في سيرفر آخر. حاول الدخول مرة أخرى.")
+		end
+
+		return false
+	end
+
+	local key = playerKey(userId)
+
+	for attempt = 1, CONFIG.LoadRetries do
+		local budgetReady = waitForBudget(
+			Enum.DataStoreRequestType.StandardRead,
+			CONFIG.MinimumReadBudget,
+			CONFIG.DataStoreBudgetTimeout
+		)
+
+		if budgetReady then
+			local success, data = safeCall("PlayerLoad", function()
+				return Store:GetAsync(key)
+			end)
+
+			if success then
+				self.PlayerData[userId] = mergeDefaults(data)
+				self.PlayerLoaded[userId] = true
+				self.PlayerLoading[userId] = nil
+				self.Stats.Loads += 1
+
+				return true
+			end
+		end
+
+		task.wait(retryDelay(attempt))
+	end
+
+	self.PlayerLoading[userId] = nil
+	self.Stats.LoadFailures += 1
+
+	self:ReleaseSession(player)
+
+	return false
+end
+
+function Manager:SavePlayer(player)
+	if not player then
+		return false
+	end
+
+	local userId = player.UserId
+
+	if not self.PlayerLoaded[userId] then
+		return false
+	end
+
+	if self.PlayerSaving[userId] then
+		return false
+	end
+
+	local data = self.PlayerData[userId]
+
+	if type(data) ~= "table" then
+		return false
+	end
+
+	self.PlayerSaving[userId] = true
+
+	local key = playerKey(userId)
+	local saved = false
+
+	for attempt = 1, CONFIG.SaveRetries do
+		local budgetReady = waitForBudget(
+			Enum.DataStoreRequestType.StandardWrite,
+			CONFIG.MinimumWriteBudget,
+			CONFIG.DataStoreBudgetTimeout
+		)
+
+		if budgetReady then
+			local snapshot = deepCopy(data)
+
+			local success = safeCall("PlayerSave", function()
+				Store:UpdateAsync(
+					key,
+					function()
+						return snapshot
+					end
+				)
+			end)
+
+			if success then
+				saved = true
+				self.Stats.Saves += 1
+				break
+			end
+		end
+
+		task.wait(retryDelay(attempt))
+	end
+
+	if not saved then
+		self.Stats.SaveFailures += 1
+	end
+
+	self.PlayerSaving[userId] = nil
+
+	return saved
+end
+
+function Manager:GetData(player)
+	if not player then
+		return nil
+	end
+
+	return self.PlayerData[player.UserId]
+end
+
+function Manager:Get(player, key)
+	local data = self:GetData(player)
+
+	if not data then
+		return nil
+	end
+
+	return data[key]
+end
+
+function Manager:Set(player, key, value)
+	local data = self:GetData(player)
+
+	if not data then
+		return false
+	end
+
+	data[key] = value
+
+	return true
+end
+
+function Manager:Add(player, key, amount)
+	local data = self:GetData(player)
+
+	if not data then
+		return false
+	end
+
+	if type(data[key]) ~= "number" then
+		return false
+	end
+
+	if type(amount) ~= "number" then
+		return false
+	end
+
+	data[key] += amount
+
+	return true
+end
+
+function Manager:SyncAttributes(player)
+	local data = self:GetData(player)
+
+	if not data then
+		return
+	end
+
+	if not player.Parent then
+		return
+	end
+
+	player:SetAttribute("Coins", tonumber(data.Coins) or 0)
+	player:SetAttribute("Level", tonumber(data.Level) or 1)
+	player:SetAttribute("XP", tonumber(data.XP) or 0)
+end
+
+function Manager:InitializePlayer(player)
+	if ShutdownStarted then
+		return
+	end
+
+	if not player.Parent then
+		return
+	end
+
+	local loaded = self:LoadPlayer(player)
+
+	if not loaded then
+		if player.Parent then
+			player:Kick("تعذر تحميل بياناتك بأمان. حاول الدخول مرة أخرى.")
+		end
+
+		return
+	end
+
+	self:SyncAttributes(player)
+end
+
+function Manager:RemovePlayer(player)
+	local userId = player.UserId
+
+	if self.PlayerLoaded[userId] then
+		self:SavePlayer(player)
+	end
+
+	self:ReleaseSession(player)
+
+	self.PlayerData[userId] = nil
+	self.PlayerLoaded[userId] = nil
+	self.PlayerLoading[userId] = nil
+	self.PlayerSaving[userId] = nil
+end
+
+function Manager:AutoSaveLoop()
+	while not ShutdownStarted do
+		task.wait(CONFIG.AutoSaveInterval)
+
+		if ShutdownStarted then
+			break
+		end
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			if self.PlayerLoaded[player.UserId] and not self.PlayerSaving[player.UserId] then
+				self:TrackTask(
+					"AutoSave_" .. tostring(player.UserId),
+					function()
+						self:SavePlayer(player)
+					end
+				)
+
+				task.wait(0.1)
+			end
+		end
+	end
+end
+
+function Manager:SessionLoop()
+	while not ShutdownStarted do
+		task.wait(CONFIG.SessionRefreshInterval)
+
+		if ShutdownStarted then
+			break
+		end
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			if self.PlayerSessions[player.UserId] then
+				self:RefreshSession(player)
+			end
+
+			task.wait(0.05)
+		end
+	end
+end
+
+function Manager:Cleanup()
+	self.Stats.CleanupRuns += 1
+
+	for index = #self.Tasks, 1, -1 do
+		local info = self.Tasks[index]
+
+		if not info.Running then
+			table.remove(self.Tasks, index)
+		end
+	end
+
+	for instance in pairs(self.CleanupObjects) do
+		if not instance.Parent then
+			self.CleanupObjects[instance] = nil
+		end
+	end
+
+	local activePlayers = {}
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		activePlayers[player.UserId] = true
+	end
+
+	for userId in pairs(self.PlayerData) do
+		if not activePlayers[userId] then
+			if not self.PlayerSaving[userId] then
+				self.PlayerData[userId] = nil
+				self.PlayerLoaded[userId] = nil
+				self.PlayerLoading[userId] = nil
+				self.PlayerSessions[userId] = nil
+			end
+		end
+	end
+end
+
+function Manager:CleanupLoop()
+	while not ShutdownStarted do
+		task.wait(CONFIG.CleanupInterval)
+
+		if ShutdownStarted then
+			break
+		end
+
+		safeCall("Cleanup", function()
+			self:Cleanup()
+		end)
+	end
+end
+
+function Manager:HealthLoop()
+	while not ShutdownStarted do
+		task.wait(CONFIG.HealthInterval)
+
+		if ShutdownStarted then
+			break
+		end
+
+		self.Stats.HealthChecks += 1
+
+		safeCall("Health", function()
+			self:CheckServices()
+
+			for _, player in ipairs(Players:GetPlayers()) do
+				if self.PlayerSessions[player.UserId] then
+					self:RefreshSession(player)
+				end
+
+				if self.PlayerLoaded[player.UserId] then
+					self:SyncAttributes(player)
+				end
+			end
+		end)
+	end
+end
+
+function Manager:RuntimeLoop()
+	while not ShutdownStarted do
+		task.wait(5)
+
+		if ShutdownStarted then
+			break
+		end
+
+		self.Stats.Heartbeats += 1
+
+		self:HeartbeatService("ServerManager")
+
+		if #self.Tasks > CONFIG.MaxTrackedTasks * 0.8 then
+			warnLog("High task registry count:", #self.Tasks)
+		end
+
+		if #self.Connections > CONFIG.MaxTrackedConnections * 0.8 then
+			warnLog("High connection registry count:", #self.Connections)
+		end
+	end
+end
+
+function Manager:StatusLoop()
+	while not ShutdownStarted do
+		task.wait(CONFIG.StatusInterval)
+
+		if ShutdownStarted then
+			break
+		end
+
+		if CONFIG.EnableStatus then
+			local info = self:GetInfo()
+
+			print(
+				string.format(
+					"[ServerManagerV4] Age %.2fh | Players %d | Loads %d | Saves %d | SaveFailures %d | Errors %d | Tasks %d",
+					info.AgeHours,
+					info.Players,
+					info.Loads,
+					info.Saves,
+					info.SaveFailures,
+					info.Errors,
+					info.Tasks
+				)
+			)
+		end
+	end
+end
+
+function Manager:SaveAllPlayers()
+	local players = Players:GetPlayers()
+	local pending = 0
+	local finished = Instance.new("BindableEvent")
+
+	for _, player in ipairs(players) do
+		if self.PlayerLoaded[player.UserId] then
+			pending += 1
+
+			task.spawn(function()
+				pcall(function()
+					self:SavePlayer(player)
+				end)
+
+				pending -= 1
+
+				if pending <= 0 then
+					finished:Fire()
+				end
+			end)
+		end
+	end
+
+	if pending > 0 then
+		local started = os.clock()
+
+		while pending > 0 and os.clock() - started < CONFIG.ShutdownBudget do
+			task.wait(0.1)
+		end
+	end
+
+	finished:Destroy()
+end
+
+function Manager:ReleaseAllSessions()
+	local players = Players:GetPlayers()
+
+	local pending = 0
+	local finished = Instance.new("BindableEvent")
+
+	for _, player in ipairs(players) do
+		if self.PlayerSessions[player.UserId] then
+			pending += 1
+
+			task.spawn(function()
+				pcall(function()
+					self:ReleaseSession(player)
+				end)
+
+				pending -= 1
+
+				if pending <= 0 then
+					finished:Fire()
+				end
+			end)
+		end
+	end
+
+	if pending > 0 then
+		local started = os.clock()
+
+		while pending > 0 and os.clock() - started < 5 do
+			task.wait(0.1)
+		end
+	end
+
+	finished:Destroy()
+end
+
+function Manager:Shutdown(closeReason)
+	if ShutdownStarted then
+		return
+	end
+
+	ShutdownStarted = true
+
+	log("Shutdown started:", closeReason)
+
+	local started = os.clock()
+
+	self:SaveAllPlayers()
+
+	local remaining = math.max(
+		0,
+		CONFIG.ShutdownBudget - (os.clock() - started)
+	)
+
+	if remaining > 0 then
+		task.wait(math.min(remaining, 0.5))
+	end
+
+	self:ReleaseAllSessions()
+
+	for _, connection in ipairs(self.Connections) do
+		if connection.Connected then
+			connection:Disconnect()
+		end
+	end
+
+	table.clear(self.Connections)
+
+	log("Shutdown completed")
+end
+
+Manager:Connect(
+	Players.PlayerAdded,
+	function(player)
+		if ShutdownStarted then
+			return
+		end
+
+		Manager.Stats.PlayersJoined += 1
+
+		Manager:TrackTask(
+			"Initialize_" .. tostring(player.UserId),
+			function()
+				Manager:InitializePlayer(player)
+			end
+		)
+	end
+)
+
+Manager:Connect(
+	Players.PlayerRemoving,
+	function(player)
+		Manager.Stats.PlayersLeft += 1
+
+		Manager:TrackTask(
+			"Remove_" .. tostring(player.UserId),
+			function()
+				Manager:RemovePlayer(player)
+			end
+		)
+	end
+)
+
+game.ServerRestartScheduled:Connect(function()
+	if ShutdownStarted then
+		return
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if Manager.PlayerLoaded[player.UserId] then
+			Manager:TrackTask(
+				"RestartSave_" .. tostring(player.UserId),
+				function()
+					Manager:SavePlayer(player)
+				end
+			)
+		end
+	end
+end)
+
+game:BindToClose(function(closeReason)
+	Manager:Shutdown(closeReason)
+end)
+
+Manager:RegisterService("ServerManager")
+
+_G.ServerManager = Manager
+
+for _, player in ipairs(Players:GetPlayers()) do
+	Manager.Stats.PlayersJoined += 1
+
+	Manager:TrackTask(
+		"Initial_" .. tostring(player.UserId),
+		function()
+			Manager:InitializePlayer(player)
+		end
+	)
+end
+
+Manager:TrackTask(
+	"Runtime",
+	function()
+		Manager:RuntimeLoop()
+	end
+)
+
+Manager:TrackTask(
+	"Health",
+	function()
+		Manager:HealthLoop()
+	end
+)
+
+Manager:TrackTask(
+	"AutoSave",
+	function()
+		Manager:AutoSaveLoop()
+	end
+)
+
+Manager:TrackTask(
+	"Session",
+	function()
+		Manager:SessionLoop()
+	end
+)
+
+Manager:TrackTask(
+	"Cleanup",
+	function()
+		Manager:CleanupLoop()
+	end
+)
+
+Manager:TrackTask(
+	"Status",
+	function()
+		Manager:StatusLoop()
+	end
+)
+
+print("[ServerManagerV4] ONLINE")
+print("[ServerManagerV4] JobId:", ServerId)
+print("[ServerManagerV4] Target Runtime: Long-Term Stability")
