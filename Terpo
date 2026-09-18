@@ -1,0 +1,774 @@
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local ScriptContext = game:GetService("ScriptContext")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local Stats = game:GetService("Stats")
+local Debris = game:GetService("Debris")
+local CollectionService = game:GetService("CollectionService")
+
+local CONFIG = {
+	PING_INTERVAL = 30,
+	GC_ROUTINE_INTERVAL = 90,
+	GC_PRESSURE_INTERVAL = 20,
+	GC_CRITICAL_INTERVAL = 5,
+	DEEP_SCAN_INTERVAL = 600,
+	STATE_SAVE_INTERVAL = 120,
+	PLAYER_SWEEP_INTERVAL = 45,
+	LEAK_SCAN_INTERVAL = 180,
+	MEMORY_SAMPLE_INTERVAL = 10,
+	MEMORY_TREND_WINDOW = 60,
+	MEMORY_HIGH_MB = 700,
+	MEMORY_CRITICAL_MB = 1100,
+	MEMORY_EMERGENCY_MB = 1600,
+	MEMORY_LETHAL_MB = 2400,
+	MEMORY_TREND_WARN = 15,
+	MEMORY_TREND_CRITICAL = 40,
+	MEMORY_TREND_LETHAL = 80,
+	GC_CYCLES_ROUTINE = 3,
+	GC_CYCLES_PRESSURE = 5,
+	GC_CYCLES_CRITICAL = 8,
+	GC_CYCLES_EMERGENCY = 12,
+	GC_CYCLES_LETHAL = 20,
+	MAX_THREADS_WARN = 2000,
+	CONNECTION_GROWTH_WARN = 200,
+	INSTANCE_GROWTH_WARN = 3000,
+	STATE_STORE = "SBS_State",
+	STATE_EXPIRY = 2592000,
+	LOG_ENABLED = true,
+	ORPHAN_PATTERNS = {"^Temp", "^Debris", "^Trash", "^FX_", "^Effect", "^VFX", "^Cache", "^Tmp", "^Transient"},
+	RESERVED_NAMES = {"Terrain", "Camera", "Baseplate", "SpawnLocation"},
+	AUTO_PING = true,
+	AUTO_CLEANUP = true,
+	AUTO_SAVE = true,
+	MAX_DEBRIS_LIFETIME = 30,
+}
+
+local T0 = os.clock()
+local stats = {
+	keepAlivePings = 0, gcRuns = 0, instancesCleared = 0, connectionsPurged = 0,
+	threadsKilled = 0, soundsStopped = 0, charactersCleaned = 0, errorsCaught = 0,
+	emergencyCleanups = 0, criticalCleanups = 0, pressureCleanups = 0, stateSaves = 0,
+	stateLoads = 0, orphansCleared = 0, leakScans = 0, leaksDetected = 0,
+	particlesCleared = 0, deepScans = 0, playerSweeps = 0,
+}
+
+local tracked = { instances = {}, connections = {}, threads = {}, tables = {} }
+local activeTweens = {}
+local playerLeaveCleanupRegistry = {}
+local memorySamples = {}
+local leakBaseline = { connections = 0, instances = 0, threads = 0, timestamp = os.clock() }
+
+local state = {
+	Version = 4,
+	StartedAt = os.time(),
+	LastPing = os.time(),
+	LastCleanup = os.time(),
+	LastSave = os.time(),
+	LastDeepScan = os.time(),
+	Uptime = 0,
+	MemoryMB = 0,
+	ServerMemoryMB = 0,
+	PlayerCount = 0,
+	TotalCleanups = 0,
+}
+
+local function log(...)
+	if CONFIG.LOG_ENABLED then
+		print("[SBS]", ...)
+	end
+end
+
+local function warnLog(...)
+	warn("[SBS]", ...)
+end
+
+local function safeCall(fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then
+		stats.errorsCaught += 1
+	end
+	return ok, err
+end
+
+local function getMemoryMB()
+	local ok, mb = pcall(function()
+		return collectgarbage("count") / 1024
+	end)
+	return ok and mb or 0
+end
+
+local function getServerMemoryMB()
+	local ok, mb = pcall(function()
+		return Stats:GetTotalMemoryUsageMb()
+	end)
+	return ok and mb or getMemoryMB()
+end
+
+local function getInstanceCount()
+	local n = 0
+	safeCall(function()
+		local ok, count = pcall(function() return #game:GetDescendants() end)
+		if ok then n = count end
+	end)
+	return n
+end
+
+local function getThreadCount()
+	local n = 0
+	safeCall(function()
+		if not getgc then return end
+		local ok, gc = pcall(getgc)
+		if ok and type(gc) == "table" then
+			for _, obj in ipairs(gc) do
+				if type(obj) == "thread" and coroutine.status(obj) ~= "dead" then
+					n += 1
+				end
+			end
+		end
+	end)
+	return n
+end
+
+local function pushMemorySample(mb)
+	table.insert(memorySamples, {t = os.clock(), mb = mb})
+	local cutoff = os.clock() - CONFIG.MEMORY_TREND_WINDOW
+	while #memorySamples > 0 and memorySamples[1].t < cutoff do
+		table.remove(memorySamples, 1)
+	end
+	if #memorySamples > 500 then
+		table.remove(memorySamples, 1)
+	end
+end
+
+local function getMemoryTrend()
+	if #memorySamples < 3 then return 0 end
+	local first = memorySamples[1]
+	local last = memorySamples[#memorySamples]
+	local dt = last.t - first.t
+	if dt <= 0 then return 0 end
+	return ((last.mb - first.mb) / dt) * 60
+end
+
+local function forceGC(cycles)
+	cycles = cycles or CONFIG.GC_CYCLES_ROUTINE
+	for _ = 1, cycles do
+		safeCall(collectgarbage, "collect")
+	end
+	stats.gcRuns += 1
+end
+
+local function keepAlivePing()
+	stats.keepAlivePings += 1
+	state.LastPing = os.time()
+	local now = os.time()
+	local uptime = math.floor(os.clock() - T0)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		safeCall(function()
+			plr:SetAttribute("SBS_Ping", now)
+			plr:SetAttribute("SBS_Uptime", uptime)
+		end)
+	end
+	return #Players:GetPlayers() > 0
+end
+
+local function isOrphanName(name)
+	for _, pattern in ipairs(CONFIG.ORPHAN_PATTERNS) do
+		if name:match(pattern) then return true end
+	end
+	return false
+end
+
+local function isReservedName(name)
+	for _, reserved in ipairs(CONFIG.RESERVED_NAMES) do
+		if name == reserved then return true end
+	end
+	return false
+end
+
+local function clearDebris()
+	local cleared = 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		local ok = safeCall(function()
+			if not obj.Parent then return end
+			if isReservedName(obj.Name) then return end
+			if obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Decal") or obj:IsA("MeshPart") or obj:IsA("UnionOperation") then
+				local spawnTime = obj:GetAttribute("SBS_Age")
+				if isOrphanName(obj.Name) and spawnTime and (os.time() - spawnTime) > CONFIG.MAX_DEBRIS_LIFETIME then
+					obj:Destroy()
+					cleared += 1
+				elseif isOrphanName(obj.Name) and not spawnTime then
+					obj:SetAttribute("SBS_Age", os.time())
+				end
+			end
+		end)
+		if not ok then break end
+	end
+	stats.instancesCleared += cleared
+	stats.orphansCleared += cleared
+	return cleared
+end
+
+local function clearSounds()
+	local cleared = 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("Sound") then
+			safeCall(function()
+				if obj.Playing and (obj.SoundId == "" or obj.SoundId == "rbxassetid://0") then
+					obj:Stop()
+					cleared += 1
+				end
+			end)
+		end
+	end
+	stats.soundsStopped += cleared
+	return cleared
+end
+
+local function clearParticles()
+	local cleared = 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+			safeCall(function()
+				if obj.Enabled and obj.Parent and obj.Parent.Parent == nil then
+					obj.Enabled = false
+					cleared += 1
+				end
+			end)
+		end
+	end
+	stats.particlesCleared += cleared
+	return cleared
+end
+
+local function cleanupCharacters()
+	local cleaned = 0
+	for _, obj in ipairs(Workspace:GetChildren()) do
+		if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then
+			if not Players:GetPlayerFromCharacter(obj) then
+				safeCall(function()
+					obj:Destroy()
+					cleaned += 1
+				end)
+			end
+		end
+	end
+	stats.charactersCleaned += cleaned
+	return cleaned
+end
+
+local function purgeConnections()
+	local purged = 0
+	for i = #tracked.connections, 1, -1 do
+		local entry = tracked.connections[i]
+		if entry.conn and entry.conn.Connected then
+			safeCall(function()
+				entry.conn:Disconnect()
+				purged += 1
+			end)
+		end
+		table.remove(tracked.connections, i)
+	end
+	stats.connectionsPurged += purged
+	return purged
+end
+
+local function killThreads()
+	local killed = 0
+	for i = #tracked.threads, 1, -1 do
+		local entry = tracked.threads[i]
+		if entry.thread and coroutine.status(entry.thread) ~= "dead" then
+			safeCall(function()
+				task.cancel(entry.thread)
+				killed += 1
+			end)
+		end
+		table.remove(tracked.threads, i)
+	end
+	stats.threadsKilled += killed
+	return killed
+end
+
+local function clearTrackedInstances()
+	local cleared = 0
+	for i = #tracked.instances, 1, -1 do
+		local entry = tracked.instances[i]
+		if entry.object and entry.object.Parent ~= nil then
+			safeCall(function()
+				entry.object:Destroy()
+				cleared += 1
+			end)
+		end
+		table.remove(tracked.instances, i)
+	end
+	return cleared
+end
+
+local function clearTrackedTables()
+	local cleared = 0
+	for i = #tracked.tables, 1, -1 do
+		local entry = tracked.tables[i]
+		if entry.table then
+			for k in pairs(entry.table) do
+				entry.table[k] = nil
+			end
+			cleared += 1
+		end
+		table.remove(tracked.tables, i)
+	end
+	return cleared
+end
+
+local function cleanCompletedTweens()
+	local removed = 0
+	for i = #activeTweens, 1, -1 do
+		local tween = activeTweens[i]
+		if tween.PlaybackState == Enum.PlaybackState.Completed or tween.PlaybackState == Enum.PlaybackState.Cancelled then
+			table.remove(activeTweens, i)
+			removed += 1
+		end
+	end
+	return removed
+end
+
+local function resetLighting()
+	safeCall(function()
+		for _, effect in ipairs(Lighting:GetChildren()) do
+			if (effect:IsA("PostEffect") or effect:IsA("Atmosphere") or effect:IsA("Sky") or effect:IsA("BloomEffect") or effect:IsA("ColorCorrectionEffect") or effect:IsA("BlurEffect")) and (effect.Name:match("^Temp") or effect.Name:match("^Cache")) then
+				effect:Destroy()
+			end
+		end
+	end)
+end
+
+local function cleanupCollections()
+	safeCall(function()
+		for _, tag in ipairs(CollectionService:GetTags(Workspace)) do
+			if tag:match("^Temp") or tag:match("^Cache") then
+				for _, obj in ipairs(CollectionService:GetTagged(tag)) do
+					safeCall(function()
+						CollectionService:RemoveTag(obj, tag)
+						if obj.Parent == nil then
+							obj:Destroy()
+						end
+					end)
+				end
+			end
+		end
+	end)
+end
+
+local function deepScan()
+	stats.deepScans += 1
+	state.LastDeepScan = os.time()
+
+	local memBefore = getMemoryMB()
+	local report = {
+		instances = getInstanceCount(),
+		threads = getThreadCount(),
+		connections = #tracked.connections,
+		memory = memBefore,
+	}
+
+	report.orphans = clearDebris()
+	cleanupCollections()
+	clearParticles()
+	resetLighting()
+
+	forceGC(CONFIG.GC_CYCLES_CRITICAL)
+
+	report.freed = math.max(0, memBefore - getMemoryMB())
+
+	log(string.format(
+		"DeepScan | Instances: %d | Threads: %d | Orphans: %d | Freed: %.1f MB",
+		report.instances, report.threads, report.orphans, report.freed
+	))
+
+	return report
+end
+
+local function leakScan()
+	stats.leakScans += 1
+	local now = os.clock()
+	local currentConnections = #tracked.connections
+	local currentInstances = getInstanceCount()
+	local currentThreads = getThreadCount()
+
+	local elapsed = now - leakBaseline.timestamp
+	if elapsed < 60 then return end
+
+	local connGrowth = currentConnections - leakBaseline.connections
+	local instGrowth = currentInstances - leakBaseline.instances
+	local threadGrowth = currentThreads - leakBaseline.threads
+	local detected = false
+
+	if connGrowth > CONFIG.CONNECTION_GROWTH_WARN then
+		warnLog("Connection leak suspected:", connGrowth)
+		detected = true
+	end
+	if instGrowth > CONFIG.INSTANCE_GROWTH_WARN then
+		warnLog("Instance leak suspected:", instGrowth)
+		detected = true
+	end
+	if threadGrowth > CONFIG.MAX_THREADS_WARN then
+		warnLog("Thread leak suspected:", threadGrowth)
+		detected = true
+	end
+
+	if detected then
+		stats.leaksDetected += 1
+		purgeConnections()
+		killThreads()
+		clearTrackedInstances()
+		clearTrackedTables()
+		forceGC(CONFIG.GC_CYCLES_CRITICAL)
+	end
+
+	leakBaseline = { connections = currentConnections, instances = currentInstances, threads = currentThreads, timestamp = now }
+end
+
+local function fullCleanup(level)
+	local before = getMemoryMB()
+	local t0 = os.clock()
+
+	local conns = purgeConnections()
+	local threads = killThreads()
+	local instances = clearTrackedInstances()
+	local tables = clearTrackedTables()
+	local debris = clearDebris()
+	local sounds = clearSounds()
+	local tweens = cleanCompletedTweens()
+	local chars = cleanupCharacters()
+
+	if level == "deep" or level == "emergency" or level == "lethal" then
+		clearParticles()
+		resetLighting()
+		cleanupCollections()
+	end
+
+	if level == "emergency" then
+		forceGC(CONFIG.GC_CYCLES_EMERGENCY)
+	elseif level == "critical" then
+		forceGC(CONFIG.GC_CYCLES_CRITICAL)
+	elseif level == "pressure" then
+		forceGC(CONFIG.GC_CYCLES_PRESSURE)
+	elseif level == "lethal" then
+		forceGC(CONFIG.GC_CYCLES_LETHAL)
+	else
+		forceGC(CONFIG.GC_CYCLES_ROUTINE)
+	end
+
+	local freed = math.max(0, before - getMemoryMB())
+	local duration = os.clock() - t0
+
+	state.LastCleanup = os.time()
+	state.MemoryMB = getMemoryMB()
+	state.TotalCleanups += 1
+
+	log(string.format(
+		"Cleanup[%s] | C:%d T:%d I:%d Tbl:%d Debris:%d S:%d Tw:%d Ch:%d | Freed:%.1fMB | %.3fs",
+		level, conns, threads, instances, tables, debris, sounds, tweens, chars, freed, duration
+	))
+
+	return freed
+end
+
+local function saveState()
+	state.PlayerCount = #Players:GetPlayers()
+	state.MemoryMB = getMemoryMB()
+	state.ServerMemoryMB = getServerMemoryMB()
+	state.Uptime = math.floor(os.clock() - T0)
+	state.LastSave = os.time()
+
+	local ok = safeCall(function()
+		local store = MemoryStoreService:GetHashMap(CONFIG.STATE_STORE)
+		store:SetAsync("state", state, CONFIG.STATE_EXPIRY)
+	end)
+
+	if ok then
+		stats.stateSaves += 1
+	end
+	return ok
+end
+
+local function loadState()
+	local ok, result = safeCall(function()
+		local store = MemoryStoreService:GetHashMap(CONFIG.STATE_STORE)
+		return store:GetAsync("state")
+	end)
+
+	if ok and type(result) == "table" then
+		for k, v in pairs(result) do
+			state[k] = v
+		end
+		stats.stateLoads += 1
+		log("State loaded from MemoryStore")
+	end
+	return ok
+end
+
+local function adaptiveGCInterval()
+	local mem = getMemoryMB()
+	local trend = getMemoryTrend()
+
+	if mem >= CONFIG.MEMORY_LETHAL_MB or trend >= CONFIG.MEMORY_TREND_LETHAL then
+		return CONFIG.GC_CRITICAL_INTERVAL
+	elseif mem >= CONFIG.MEMORY_EMERGENCY_MB or trend >= CONFIG.MEMORY_TREND_CRITICAL then
+		return CONFIG.GC_CRITICAL_INTERVAL
+	elseif mem >= CONFIG.MEMORY_CRITICAL_MB or trend >= CONFIG.MEMORY_TREND_WARN then
+		return CONFIG.GC_PRESSURE_INTERVAL
+	elseif mem >= CONFIG.MEMORY_HIGH_MB then
+		return CONFIG.GC_ROUTINE_INTERVAL / 2
+	end
+	return CONFIG.GC_ROUTINE_INTERVAL
+end
+
+local function evaluatePressure()
+	local mem = getMemoryMB()
+	local serverMem = getServerMemoryMB()
+	local trend = getMemoryTrend()
+	local peak = math.max(mem, serverMem)
+
+	if peak >= CONFIG.MEMORY_LETHAL_MB or trend >= CONFIG.MEMORY_TREND_LETHAL then
+		warnLog(string.format("LETHAL | Mem: %.1f MB | Trend: %.1f MB/min", peak, trend))
+		fullCleanup("lethal")
+		saveState()
+		return "lethal"
+	elseif peak >= CONFIG.MEMORY_EMERGENCY_MB or trend >= CONFIG.MEMORY_TREND_CRITICAL then
+		warnLog(string.format("EMERGENCY | Mem: %.1f MB | Trend: %.1f MB/min", peak, trend))
+		stats.emergencyCleanups += 1
+		fullCleanup("emergency")
+		return "emergency"
+	elseif peak >= CONFIG.MEMORY_CRITICAL_MB then
+		stats.criticalCleanups += 1
+		fullCleanup("critical")
+		return "critical"
+	elseif peak >= CONFIG.MEMORY_HIGH_MB then
+		stats.pressureCleanups += 1
+		fullCleanup("pressure")
+		return "pressure"
+	end
+	return "normal"
+end
+
+local function playerSweep()
+	stats.playerSweeps += 1
+	local cleaned = 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		safeCall(function()
+			local backpack = plr:FindFirstChildOfClass("Backpack")
+			if backpack then
+				local items = backpack:GetChildren()
+				if #items > 100 then
+					for i = 101, #items do
+						items[i]:Destroy()
+						cleaned += 1
+					end
+				end
+			end
+		end)
+	end
+	return cleaned
+end
+
+local function getStatsReport()
+	local uptime = math.floor(os.clock() - T0)
+	return {
+		uptime = uptime,
+		uptimeFormatted = string.format("%dh %dm %ds", math.floor(uptime / 3600), math.floor((uptime % 3600) / 60), uptime % 60),
+		memory = getMemoryMB(),
+		serverMemory = getServerMemoryMB(),
+		memoryTrend = getMemoryTrend(),
+		playerCount = #Players:GetPlayers(),
+		instanceCount = getInstanceCount(),
+		threadCount = getThreadCount(),
+		keepAlivePings = stats.keepAlivePings,
+		gcRuns = stats.gcRuns,
+		instancesCleared = stats.instancesCleared,
+		connectionsPurged = stats.connectionsPurged,
+		threadsKilled = stats.threadsKilled,
+		soundsStopped = stats.soundsStopped,
+		charactersCleaned = stats.charactersCleaned,
+		errorsCaught = stats.errorsCaught,
+		emergencyCleanups = stats.emergencyCleanups,
+		criticalCleanups = stats.criticalCleanups,
+		pressureCleanups = stats.pressureCleanups,
+		stateSaves = stats.stateSaves,
+		stateLoads = stats.stateLoads,
+		orphansCleared = stats.orphansCleared,
+		leakScans = stats.leakScans,
+		leaksDetected = stats.leaksDetected,
+		particlesCleared = stats.particlesCleared,
+		deepScans = stats.deepScans,
+		playerSweeps = stats.playerSweeps,
+	}
+end
+
+local Manager = {}
+Manager.__index = Manager
+
+function Manager:Track(instance)
+	if not instance or typeof(instance) ~= "Instance" then return end
+	table.insert(tracked.instances, {object = instance, createdAt = os.clock()})
+end
+
+function Manager:TrackConnection(connection)
+	if not connection then return end
+	table.insert(tracked.connections, {conn = connection, createdAt = os.clock()})
+end
+
+function Manager:TrackThread(thread)
+	if not thread then return end
+	table.insert(tracked.threads, {thread = thread, createdAt = os.clock()})
+end
+
+function Manager:TrackTable(tbl)
+	if not tbl or type(tbl) ~= "table" then return end
+	table.insert(tracked.tables, {table = tbl, createdAt = os.clock()})
+end
+
+function Manager:TrackTween(tween)
+	table.insert(activeTweens, tween)
+end
+
+function Manager:TagTemporary(instance, lifetime)
+	if not instance or not instance:IsA("Instance") then return end
+	instance:SetAttribute("SBS_Age", os.time())
+	Debris:AddItem(instance, lifetime or CONFIG.MAX_DEBRIS_LIFETIME)
+end
+
+function Manager:RegisterPlayerCleanup(player, cleanupFn)
+	playerLeaveCleanupRegistry[player] = playerLeaveCleanupRegistry[player] or {}
+	table.insert(playerLeaveCleanupRegistry[player], cleanupFn)
+end
+
+function Manager:GetStats()
+	return getStatsReport()
+end
+
+function Manager:ForceCleanup(level)
+	return fullCleanup(level or "pressure")
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	task.defer(function()
+		local fns = playerLeaveCleanupRegistry[player]
+		if fns then
+			for _, fn in ipairs(fns) do
+				pcall(fn, player)
+			end
+			playerLeaveCleanupRegistry[player] = nil
+		end
+		forceGC(1)
+	end)
+end)
+
+Players.PlayerAdded:Connect(function(player)
+	safeCall(function()
+		player:SetAttribute("SBS_Uptime", math.floor(os.clock() - T0))
+		player:SetAttribute("SBS_Ping", os.time())
+		player:SetAttribute("SBS_ServerVersion", state.Version)
+	end)
+end)
+
+ScriptContext.Error:Connect(function()
+	stats.errorsCaught += 1
+end)
+
+task.spawn(function()
+	loadState()
+	log("Bootstrap complete | Uptime: 0s")
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.PING_INTERVAL)
+		if CONFIG.AUTO_PING then
+			keepAlivePing()
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(adaptiveGCInterval())
+		if CONFIG.AUTO_CLEANUP then
+			evaluatePressure()
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.MEMORY_SAMPLE_INTERVAL)
+		pushMemorySample(getMemoryMB())
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.STATE_SAVE_INTERVAL)
+		if CONFIG.AUTO_SAVE then
+			saveState()
+		end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.LEAK_SCAN_INTERVAL)
+		leakScan()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.DEEP_SCAN_INTERVAL)
+		deepScan()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.PLAYER_SWEEP_INTERVAL)
+		playerSweep()
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(300)
+		local s = getStatsReport()
+		log(string.format(
+			"REPORT | Up: %s | Mem: %.1f MB | Srv: %.1f MB | Trend: %.1f MB/min | Ply: %d | Inst: %d | Thr: %d | Err: %d | Pings: %d | GC: %d",
+			s.uptimeFormatted, s.memory, s.serverMemory, s.memoryTrend,
+			s.playerCount, s.instanceCount, s.threadCount, s.errorsCaught,
+			s.keepAlivePings, s.gcRuns
+		))
+	end
+end)
+
+game:BindToClose(function()
+	log("Shutdown - final protocol")
+
+	saveState()
+	fullCleanup("lethal")
+	purgeConnections()
+	killThreads()
+	clearTrackedTables()
+	cleanupCollections()
+	forceGC(CONFIG.GC_CYCLES_LETHAL)
+
+	local finalReport = getStatsReport()
+	log(string.format(
+		"FINAL | Uptime: %s | Mem: %.1f MB | Cleaned: %d | GC: %d | Errors: %d | Leaks: %d",
+		finalReport.uptimeFormatted, finalReport.memory,
+		stats.instancesCleared + stats.connectionsPurged + stats.threadsKilled,
+		stats.gcRuns, stats.errorsCaught, stats.leaksDetected
+	))
+end)
+
+log("ServerBoost v4.0 loaded | All systems online")
+
+_G.ServerBoost = Manager
+return Manager
