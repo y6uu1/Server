@@ -1,0 +1,254 @@
+local Players             = game:GetService("Players")
+local Debris              = game:GetService("Debris")
+local Stats                = game:GetService("Stats")
+local Workspace             = game:GetService("Workspace")
+
+local CONFIG = {
+	MEMORY_CHECK_INTERVAL   = 15,
+	DEEP_CLEAN_INTERVAL     = 90,
+	LIGHT_CLEAN_INTERVAL    = 20,
+	STATUS_REPORT_INTERVAL  = 300,
+	MEMORY_WARNING_MB       = 1200,
+	MEMORY_CRITICAL_MB      = 1800,
+	MAX_DEBRIS_LIFETIME     = 30,
+	VERBOSE_LOGGING         = true,
+	TEMP_FOLDERS            = {"Effects", "Temp", "Projectiles", "VFX", "TempParts"},
+}
+
+local ServerMemoryManager = {}
+ServerMemoryManager._connections = {}
+ServerMemoryManager._stats = {
+	lastMemoryMB = 0,
+	peakMemoryMB = 0,
+	totalCleans  = 0,
+	startTime    = os.clock(),
+}
+
+local function log(msg)
+	if CONFIG.VERBOSE_LOGGING then
+		print(("[MemoryManager] %s"):format(msg))
+	end
+end
+
+local function warnLog(msg)
+	warn(("[MemoryManager] %s"):format(msg))
+end
+
+local function getServerMemoryMB()
+	local ok, result = pcall(function()
+		return Stats:GetTotalMemoryUsageMb()
+	end)
+	if ok and result then
+		return result
+	end
+	return 0
+end
+
+function ServerMemoryManager:TrackConnection(name, connection)
+	if self._connections[name] then
+		self._connections[name]:Disconnect()
+	end
+	self._connections[name] = connection
+	return connection
+end
+
+function ServerMemoryManager:TagTemporary(instance, lifetime)
+	if not instance or not instance:IsA("Instance") then return end
+	instance:SetAttribute("__spawnTime", os.clock())
+	instance:SetAttribute("__maxLifetime", lifetime or CONFIG.MAX_DEBRIS_LIFETIME)
+	Debris:AddItem(instance, lifetime or CONFIG.MAX_DEBRIS_LIFETIME)
+end
+
+local function cleanTemporaryFolders()
+	local removed = 0
+	for _, folderName in ipairs(CONFIG.TEMP_FOLDERS) do
+		local folder = Workspace:FindFirstChild(folderName)
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				local spawnTime = child:GetAttribute("__spawnTime")
+				local maxLife   = child:GetAttribute("__maxLifetime") or CONFIG.MAX_DEBRIS_LIFETIME
+				if spawnTime and (os.clock() - spawnTime) > maxLife then
+					child:Destroy()
+					removed += 1
+				end
+			end
+		end
+	end
+	return removed
+end
+
+local playerLeaveCleanupRegistry = {}
+
+function ServerMemoryManager:RegisterPlayerCleanup(player, cleanupFn)
+	playerLeaveCleanupRegistry[player] = playerLeaveCleanupRegistry[player] or {}
+	table.insert(playerLeaveCleanupRegistry[player], cleanupFn)
+end
+
+local function setupPlayerLifecycle()
+	ServerMemoryManager:TrackConnection("PlayerRemoving", Players.PlayerRemoving:Connect(function(player)
+		local fns = playerLeaveCleanupRegistry[player]
+		if fns then
+			for _, fn in ipairs(fns) do
+				pcall(fn, player)
+			end
+			playerLeaveCleanupRegistry[player] = nil
+		end
+
+		local leftovers = Workspace:FindFirstChild(player.Name .. "_Data")
+		if leftovers then
+			leftovers:Destroy()
+		end
+	end))
+end
+
+local function cleanFinishedEffects()
+	local removed = 0
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("Sound") and not obj.Playing and obj:GetAttribute("__autoManaged") then
+			obj:Destroy()
+			removed += 1
+		elseif obj:IsA("ParticleEmitter") and obj:GetAttribute("__oneShot") and obj:GetAttribute("__spawnTime") then
+			if (os.clock() - obj:GetAttribute("__spawnTime")) > 10 then
+				obj:Destroy()
+				removed += 1
+			end
+		end
+	end
+	return removed
+end
+
+local activeTweens = {}
+function ServerMemoryManager:TrackTween(tween)
+	table.insert(activeTweens, tween)
+end
+
+local function cleanCompletedTweens()
+	local removed = 0
+	for i = #activeTweens, 1, -1 do
+		local tween = activeTweens[i]
+		if tween.PlaybackState == Enum.PlaybackState.Completed
+			or tween.PlaybackState == Enum.PlaybackState.Cancelled then
+			table.remove(activeTweens, i)
+			removed += 1
+		end
+	end
+	return removed
+end
+
+local function emergencyClean()
+	warnLog("تجاوزت الذاكرة الحد الحرج! تفعيل التنظيف الطارئ...")
+
+	collectgarbage("collect")
+
+	for _, folderName in ipairs(CONFIG.TEMP_FOLDERS) do
+		local folder = Workspace:FindFirstChild(folderName)
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				child:Destroy()
+			end
+		end
+	end
+
+	collectgarbage("collect")
+end
+
+local function lightCleanLoop()
+	while true do
+		task.wait(CONFIG.LIGHT_CLEAN_INTERVAL)
+		local removedTemp   = cleanTemporaryFolders()
+		local removedTweens = cleanCompletedTweens()
+
+		ServerMemoryManager._stats.totalCleans += 1
+		if removedTemp > 0 or removedTweens > 0 then
+			log(("تنظيف خفيف: حذف %d كائن مؤقت، %d Tween منتهي"):format(removedTemp, removedTweens))
+		end
+	end
+end
+
+local function deepCleanLoop()
+	while true do
+		task.wait(CONFIG.DEEP_CLEAN_INTERVAL)
+		local removedEffects = cleanFinishedEffects()
+
+		collectgarbage("collect")
+
+		ServerMemoryManager._stats.totalCleans += 1
+		log(("تنظيف عميق مكتمل: حذف %d تأثير منتهي | GC تم تنفيذه"):format(removedEffects))
+	end
+end
+
+local function memoryMonitorLoop()
+	while true do
+		task.wait(CONFIG.MEMORY_CHECK_INTERVAL)
+		local memMB = getServerMemoryMB()
+		ServerMemoryManager._stats.lastMemoryMB = memMB
+		if memMB > ServerMemoryManager._stats.peakMemoryMB then
+			ServerMemoryManager._stats.peakMemoryMB = memMB
+		end
+
+		if memMB >= CONFIG.MEMORY_CRITICAL_MB then
+			emergencyClean()
+		elseif memMB >= CONFIG.MEMORY_WARNING_MB then
+			warnLog(("الذاكرة عند %.1f MB — تشغيل تنظيف احترازي"):format(memMB))
+			collectgarbage("collect")
+			cleanTemporaryFolders()
+			cleanFinishedEffects()
+		end
+	end
+end
+
+local function statusReportLoop()
+	while true do
+		task.wait(CONFIG.STATUS_REPORT_INTERVAL)
+		local uptime  = math.floor(os.clock() - ServerMemoryManager._stats.startTime)
+		local hours   = math.floor(uptime / 3600)
+		local minutes = math.floor((uptime % 3600) / 60)
+		local memMB   = ServerMemoryManager._stats.lastMemoryMB
+
+		log(("STATUS | Uptime: %dh %dm | Memory: %.1f MB | Peak: %.1f MB | Cleans: %d"):format(
+			hours, minutes, memMB, ServerMemoryManager._stats.peakMemoryMB, ServerMemoryManager._stats.totalCleans
+		))
+	end
+end
+
+local function finalCleanup()
+	log("تنظيف نهائي قبل إغلاق السيرفر...")
+
+	for _, folderName in ipairs(CONFIG.TEMP_FOLDERS) do
+		local folder = Workspace:FindFirstChild(folderName)
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				pcall(function() child:Destroy() end)
+			end
+		end
+	end
+
+	for _, conn in pairs(ServerMemoryManager._connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+
+	for _ = 1, 3 do
+		collectgarbage("collect")
+	end
+
+	log(("تنظيف نهائي مكتمل. إجمالي عمليات التنظيف: %d"):format(ServerMemoryManager._stats.totalCleans))
+end
+
+local function start()
+	setupPlayerLifecycle()
+
+	task.spawn(lightCleanLoop)
+	task.spawn(deepCleanLoop)
+	task.spawn(memoryMonitorLoop)
+	task.spawn(statusReportLoop)
+
+	game:BindToClose(finalCleanup)
+
+	log("تم تفعيل نظام إدارة الذاكرة الاحترافي — السيرفر الآن محسّن لأطول عمر ممكن")
+end
+
+start()
+
+_G.ServerMemoryManager = ServerMemoryManager
+
+return ServerMemoryManager
